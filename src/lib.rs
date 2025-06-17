@@ -1,10 +1,10 @@
 pub mod message;
 use message::{Message, Token};
-
 use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -17,7 +17,7 @@ type RequestNumber = u64;
 pub struct Monitor {
     id: ProcessId,
     total: usize,
-    addrs: Vec<String>, // index by process ID
+    addrs: Vec<String>,
 
     rn: Arc<Mutex<Vec<RequestNumber>>>,
     token: Arc<Mutex<Option<Token>>>,
@@ -25,9 +25,12 @@ pub struct Monitor {
     local_m: Mutex<()>,
     local_c: Condvar,
 
+    // ZMQ context for listener and sender thread
     ctx: Arc<zmq::Context>,
-    dealers: Vec<zmq::Socket>, // one dealer PER peer
     running: Arc<AtomicBool>,
+
+    // Channel to offload all outgoing sends to a dedicated thread
+    send_tx: Sender<(ProcessId, Vec<u8>)>,
 }
 
 impl Monitor {
@@ -44,14 +47,8 @@ impl Monitor {
             addrs.push(format!("tcp://{}:{}", host, base_port + pid as u16));
         }
 
-        let mut dealers = Vec::with_capacity(total);
-        for pid in 0..total {
-            let sock = ctx.socket(zmq::DEALER).unwrap();
-            sock.set_identity(id.to_string().as_bytes()).unwrap();
-            // Every dealer connects to _every_ peer (including itself is OK; we'll skip sending to self later)
-            sock.connect(&addrs[pid]).unwrap();
-            dealers.push(sock);
-        }
+        // Build sending thread
+        let (tx, rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = mpsc::channel();
 
         let initial_tok = if initial_owner == Some(id) {
             Some(Token {
@@ -65,14 +62,14 @@ impl Monitor {
         let mon = Arc::new(Self {
             id,
             total,
-            addrs,
+            addrs: addrs.clone(),
             rn: Arc::new(Mutex::new(vec![0; total])),
             token: Arc::new(Mutex::new(initial_tok)),
             local_m: Mutex::new(()),
             local_c: Condvar::new(),
             ctx: ctx.clone(),
-            dealers,
             running: Arc::new(AtomicBool::new(true)),
+            send_tx: tx,
         });
 
         // Startup barrier to ensure ROUTER binding before returning
@@ -87,41 +84,103 @@ impl Monitor {
                 producer_barrier.wait();
                 while me.running.load(Ordering::SeqCst) {
                     if let Ok(parts) = router.recv_multipart(0) {
-                        if parts.len() >= 3 {
-                            if let Some(msg) = Message::deserialize(&parts[2]) {
-                                me.handle_incoming(msg);
-                            }
+                        // parts might be [id, payload] or [id, empty, payload]
+                        let payload = parts.last().expect("ROUTER multipart missing payload");
+                        if let Some(msg) = Message::deserialize(payload) {
+                            me.handle_incoming(msg);
+                        } else {
+                            eprintln!(
+                                "[Node {}] failed to parse message from frames: {:?}",
+                                me.id, parts
+                            );
                         }
                     }
                 }
-                // router socket closes when dropped
             });
         }
-        // Wait until listener has bound
         barrier.wait();
 
+        {
+            let ctx_s = Arc::clone(&ctx);
+            let addrs_s = addrs.clone();
+            let sender = id.clone();
+            thread::spawn(move || {
+                // Pre-connect one DEALER per peer, with debug prints
+                let mut dealers = Vec::with_capacity(total);
+                for pid in 0..total {
+                    let sock = ctx_s.socket(zmq::DEALER).unwrap();
+                    sock.set_identity(id.to_string().as_bytes()).unwrap();
+                    let addr = &addrs_s[pid];
+                    match sock.connect(addr) {
+                        Ok(_) => println!(
+                            "[Sender Thread {}] Connected DEALER[{}] to {}",
+                            id, pid, addr
+                        ),
+                        Err(e) => eprintln!(
+                            "[Sender Thread {}] Failed to connect DEALER[{}] to {}: {}",
+                            id, pid, addr, e
+                        ),
+                    }
+                    dealers.push(sock);
+                }
+                // Drain the channel and send each message
+                while let Ok((pid, msg)) = rx.recv() {
+                    // println!(
+                    //     "[Sender Thread {}] Sending {} bytes to peer {}",
+                    //     id,
+                    //     msg.len(),
+                    //     pid
+                    // );
+                    if let Err(e) = dealers[pid].send(&msg, 0) {
+                        eprintln!("[Sender Thread {}] Error sending to {}: {}", id, pid, e);
+                    } else {
+                        // println!(
+                        //     "[Sender Thread {}] Successfully sent message to {}",
+                        //     id, pid
+                        // );
+                    }
+                }
+            });
+        }
         mon
     }
 
     fn handle_incoming(&self, msg: Message) {
         match msg {
             Message::Request { from, rn } => {
+                // println!(
+                //     "[Node {}] Received REQUEST from {} (rn={})",
+                //     self.id, from, rn
+                // );
                 let mut rn_lock = self.rn.lock().unwrap();
                 rn_lock[from] = rn_lock[from].max(rn);
                 drop(rn_lock);
                 if let Some(tok) = self.token.lock().unwrap().as_mut() {
                     if rn > tok.ln[from] && !tok.queue.contains(&from) {
+                        println!(
+                            "[Node {}] Enqueued requester {} => queue={:?}",
+                            self.id, from, tok.queue
+                        );
                         tok.queue.push_back(from);
-                        self.local_c.notify_all();
                     }
                 }
+                // Wake anyone waiting for the token or queue change
+                self.local_c.notify_all();
             }
             Message::Token(new_tok) => {
+                println!(
+                    "[Node {}] Received TOKEN, ln={:?}, queue={:?}",
+                    self.id, new_tok.ln, new_tok.queue
+                );
                 *self.token.lock().unwrap() = Some(new_tok);
                 self.local_c.notify_all();
             }
             Message::Signal => {
+                // println!("[Node {}] Received SIGNAL", self.id);
                 self.local_c.notify_one();
+            }
+            _ => {
+                println!("[Node {}] handles incoming did not matched msg", self.id);
             }
         }
     }
@@ -130,27 +189,21 @@ impl Monitor {
     where
         F: FnOnce() -> R,
     {
-        // bump RN
+        // bump RN and broadcast
         let my_rn = {
             let mut rn_lock = self.rn.lock().unwrap();
             rn_lock[self.id] += 1;
             rn_lock[self.id]
         };
-
-        // send REQUEST to all peers
         let req = Message::Request {
             from: self.id,
             rn: my_rn,
         }
         .serialize();
-        let dealer = self.ctx.socket(zmq::DEALER).unwrap();
-        dealer.set_identity(self.id.to_string().as_bytes()).unwrap();
         for pid in 0..self.total {
-            if pid == self.id {
-                continue;
+            if pid != self.id {
+                self.send_tx.send((pid, req.clone())).unwrap();
             }
-            dealer.connect(&self.addrs[pid]).unwrap();
-            dealer.send(&req, 0).unwrap();
         }
 
         // wait for token
@@ -180,15 +233,7 @@ impl Monitor {
             }
             if let Some(next) = tok.queue.pop_front() {
                 let tok_msg = Message::Token(tok.clone()).serialize();
-
-                // let dealer = self.ctx.socket(zmq::DEALER).unwrap();
-                // dealer.set_identity(self.id.to_string().as_bytes()).unwrap();
-                // dealer.connect(&self.addrs[next]).unwrap();
-                // dealer.send(&tok_msg, 0).unwrap();
-
-                // self.dealers[next] is already connected and ready
-                self.dealers[next].send(&tok_msg, 0).unwrap();
-
+                self.send_tx.send((next, tok_msg)).unwrap();
                 *tok_opt = None;
             }
         }
@@ -201,13 +246,10 @@ impl Monitor {
 
     fn broadcast_signal(&self) {
         let sig = Message::Signal.serialize();
-        // let dealer = self.ctx.socket(zmq::DEALER).unwrap();
-        // dealer.set_identity(self.id.to_string().as_bytes()).unwrap();
         for pid in 0..self.total {
             if pid != self.id {
-                // dealer.connect(&self.addrs[pid]).unwrap();
-                // dealer.send(&sig, 0).unwrap();
-                self.dealers[pid].send(&sig, 0).unwrap();
+                // println!("[Node {}] Broadcasting SIGNAL to {}", self.id, pid);
+                self.send_tx.send((pid, sig.clone())).unwrap();
             }
         }
     }
